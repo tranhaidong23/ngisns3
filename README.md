@@ -1,8 +1,8 @@
-uav mophong
+
 ## Yêu cầu
 
 - Docker Desktop hoặc Docker Engine
-- Git (nếu muốn clone repository)
+- Git 
 
 ## Hướng dẫn chạy
 
