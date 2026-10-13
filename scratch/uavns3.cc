@@ -1,313 +1,206 @@
-
 #include "ns3/core-module.h"
 #include "ns3/network-module.h"
 #include "ns3/internet-module.h"
 #include "ns3/mobility-module.h"
 #include "ns3/wifi-module.h"
 #include "ns3/applications-module.h"
+#include "ns3/seq-ts-header.h"
 
 #include <iostream>
 #include <iomanip>
 #include <cstdint>
+#include <map>
+#include <limits>
+#include <cmath>
 
 using namespace ns3;
 
+// Thống kê độ trễ của các gói Telemetry nhận thành công.
+struct TelemetryStats
+{
+    uint64_t received = 0;
+    double sumDelayMs = 0.0;
+    double minDelayMs = std::numeric_limits<double>::infinity();
+    double maxDelayMs = 0.0;
+    double sumJitterMs = 0.0;
+    uint64_t jitterSamples = 0;
+    // Ghi nhớ độ trễ cuối cùng theo IP nguồn để không trộn gói của các UAV.
+    std::map<Ipv4Address, double> previousDelayMs;
+};
+
+static TelemetryStats g_stats;
+
+// PacketSink nhận gói UDP; UdpClient của ns-3 gắn SeqTsHeader khi gửi.
+static void OnTelemetryReceived(Ptr<const Packet> packet, const Address& from)
+{
+    Ptr<Packet> copy = packet->Copy();
+    SeqTsHeader header;
+    if (copy->GetSize() < header.GetSerializedSize())
+    {
+        return;
+    }
+    copy->RemoveHeader(header);
+
+    double delayMs = (Simulator::Now() - header.GetTs()).GetSeconds() * 1000.0;
+    if (delayMs < 0.0)
+    {
+        return;
+    }
+
+    ++g_stats.received;
+    g_stats.sumDelayMs += delayMs;
+    g_stats.minDelayMs = std::min(g_stats.minDelayMs, delayMs);
+    g_stats.maxDelayMs = std::max(g_stats.maxDelayMs, delayMs);
+
+    if (InetSocketAddress::IsMatchingType(from))
+    {
+        Ipv4Address source = InetSocketAddress::ConvertFrom(from).GetIpv4();
+        auto previous = g_stats.previousDelayMs.find(source);
+        if (previous != g_stats.previousDelayMs.end())
+        {
+            g_stats.sumJitterMs += std::abs(delayMs - previous->second);
+            ++g_stats.jitterSamples;
+        }
+        g_stats.previousDelayMs[source] = delayMs;
+    }
+}
+
 int main(int argc, char* argv[])
 {
-    
-    // 1. CẤU HÌNH THÔNG SỐ MÔ PHỎNG
-    uint32_t numUavs = 4;             // Số lượng UAV
-    double simulationTime = 20.0;     // Thời gian mô phỏng (giây)
-    double spacing = 10.0;            // Khoảng cách giữa các UAV (mét)
+    // 1. Cấu hình thông số mô phỏng
+    uint32_t numUavs = 4;
+    double simulationTime = 20.0;
+    double spacing = 10.0;
 
-    // Cho phép thay đổi thông số khi chạy chương trình
     CommandLine cmd;
-    cmd.AddValue("simulationTime",
-                 "Thoi gian mo phong (giay)",
-                 simulationTime);
-    cmd.AddValue("spacing",
-                 "Khoang cach giua cac UAV (met)",
-                 spacing);
+    cmd.AddValue("simulationTime", "Thoi gian mo phong (giay)", simulationTime);
+    cmd.AddValue("spacing", "Khoang cach giua cac UAV (met)", spacing);
     cmd.Parse(argc, argv);
 
-
-
-
-
-    // 2. KHỞI TẠO CÁC NODE TRONG MẠNG
-    // Tạo các node đại diện cho UAV
+    // 2. Khởi tạo 4 UAV và một trạm điều khiển GCS
     NodeContainer uavs;
     uavs.Create(numUavs);
-
-    // Tạo một node đại diện cho trạm điều khiển mặt đất
     NodeContainer gcs;
     gcs.Create(1);
-
-    // Gộp tất cả node để cấu hình mạng
     NodeContainer allNodes;
     allNodes.Add(uavs);
     allNodes.Add(gcs);
 
-   
-
-
-    // 3. THIẾT LẬP MẠNG WI-FI AD HOC 
-
-    // Sử dụng Wi-Fi 802.11b với tốc độ 1 Mbps
+    // 3. Thiết lập mạng Wi-Fi Ad Hoc, 802.11b 1 Mbps
     WifiHelper wifi;
     wifi.SetStandard(WIFI_STANDARD_80211b);
-
-    wifi.SetRemoteStationManager(
-        "ns3::ConstantRateWifiManager",
-        "DataMode", StringValue("DsssRate1Mbps"),
-        "ControlMode", StringValue("DsssRate1Mbps")
-    );
-
-    // Thiết lập kênh truyền không dây
-    YansWifiChannelHelper channel =
-        YansWifiChannelHelper::Default();
-
+    wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager",
+                                 "DataMode", StringValue("DsssRate1Mbps"),
+                                 "ControlMode", StringValue("DsssRate1Mbps"));
+    YansWifiChannelHelper channel = YansWifiChannelHelper::Default();
     YansWifiPhyHelper phy;
     phy.SetChannel(channel.Create());
-
-    // Chế độ Ad Hoc: các node giao tiếp không cần Access Point
     WifiMacHelper mac;
     mac.SetType("ns3::AdhocWifiMac");
+    NetDeviceContainer devices = wifi.Install(phy, mac, allNodes);
 
-    // Gắn thiết bị Wi-Fi cho tất cả node
-    NetDeviceContainer devices =
-        wifi.Install(phy, mac, allNodes);
-
-    
-
-
-
-    // 4. THIẾT LẬP VỊ TRÍ CÁC NODE
-
+    // 4. Thiết lập vị trí cố định (UAV ở độ cao 10 m)
     MobilityHelper mobility;
-
-    Ptr<ListPositionAllocator> positions =
-        CreateObject<ListPositionAllocator>();
-
-    // Các UAV nằm trên trục X, ở độ cao 10 mét
-    for (uint32_t i = 0; i < numUavs; i++)
+    Ptr<ListPositionAllocator> positions = CreateObject<ListPositionAllocator>();
+    for (uint32_t i = 0; i < numUavs; ++i)
     {
-        positions->Add(
-            Vector((i + 1) * spacing, 0.0, 10.0)
-        );
+        positions->Add(Vector((i + 1) * spacing, 0.0, 10.0));
     }
-
-    // Trạm GCS đặt tại gốc tọa độ
     positions->Add(Vector(0.0, 0.0, 0.0));
-
     mobility.SetPositionAllocator(positions);
-
-    // Hiện tại các node đứng yên
-    // Sau này có thể cập nhật vị trí từ Gazebo
-    mobility.SetMobilityModel(
-        "ns3::ConstantPositionMobilityModel"
-    );
-
+    mobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
     mobility.Install(allNodes);
 
-    
-
-
-
-    // 5. CẤU HÌNH ĐỊA CHỈ IP
-
-    // Cài đặt giao thức TCP/IP cho các node
+    // 5. Gán địa chỉ IP
     InternetStackHelper internet;
     internet.Install(allNodes);
-
-    // Các node sử dụng cùng mạng 10.20.0.0/24
     Ipv4AddressHelper address;
-    address.SetBase(
-        "10.20.0.0",
-        "255.255.255.0"
-    );
+    address.SetBase("10.20.0.0", "255.255.255.0");
+    Ipv4InterfaceContainer interfaces = address.Assign(devices);
+    Ipv4Address gcsAddress = interfaces.GetAddress(numUavs);
 
-    Ipv4InterfaceContainer interfaces =
-        address.Assign(devices);
-
-    // Lấy địa chỉ IP của trạm GCS
-    Ipv4Address gcsAddress =
-        interfaces.GetAddress(numUavs);
-
-   
-
-
-
-
-
-    // 6. GCS NHẬN DỮ LIỆU TỪ CÁC UAV
-    
-    // Cổng UDP 3030 dùng để truyền dữ liệu telemetry
+    // 6. GCS nhận Telemetry qua UDP/3030
+    // Dùng PacketSink để đọc SeqTsHeader và tính thời gian truyền của từng gói.
     const uint16_t telemetryPort = 3030;
-
-    UdpServerHelper telemetryServer(telemetryPort);
-
-    ApplicationContainer telemetryReceiver =
-        telemetryServer.Install(gcs.Get(0));
-
+    PacketSinkHelper telemetryServer("ns3::UdpSocketFactory",
+                                     InetSocketAddress(Ipv4Address::GetAny(), telemetryPort));
+    ApplicationContainer telemetryReceiver = telemetryServer.Install(gcs.Get(0));
     telemetryReceiver.Start(Seconds(0.5));
     telemetryReceiver.Stop(Seconds(simulationTime));
+    Ptr<PacketSink> sink = DynamicCast<PacketSink>(telemetryReceiver.Get(0));
+    sink->TraceConnectWithoutContext("Rx", MakeCallback(&OnTelemetryReceived));
 
-    
-
-
-
-
-    // 7. CÁC UAV GỬI DỮ LIỆU VỀ GCS
-
-    for (uint32_t i = 0; i < numUavs; i++)
+    // 7. Mỗi UAV gửi tối đa 100 gói Telemetry, mỗi 100 ms
+    for (uint32_t i = 0; i < numUavs; ++i)
     {
-        // Mỗi UAV gửi dữ liệu đến địa chỉ IP của GCS
-        UdpClientHelper client(
-            gcsAddress,
-            telemetryPort
-        );
-
-        // Mỗi UAV gửi tối đa 100 gói
-        client.SetAttribute(
-            "MaxPackets",
-            UintegerValue(100)
-        );
-
-        // Khoảng thời gian giữa hai gói là 100 ms
-        client.SetAttribute(
-            "Interval",
-            TimeValue(MilliSeconds(100))
-        );
-
-        // Kích thước mỗi gói là 208 byte
-        client.SetAttribute(
-            "PacketSize",
-            UintegerValue(208)
-        );
-
-        ApplicationContainer sender =
-            client.Install(uavs.Get(i));
-
-        // Các UAV bắt đầu gửi lệch nhau 0,1 giây
+        UdpClientHelper client(gcsAddress, telemetryPort);
+        client.SetAttribute("MaxPackets", UintegerValue(100));
+        client.SetAttribute("Interval", TimeValue(MilliSeconds(100)));
+        client.SetAttribute("PacketSize", UintegerValue(208));
+        ApplicationContainer sender = client.Install(uavs.Get(i));
         sender.Start(Seconds(1.0 + i * 0.1));
         sender.Stop(Seconds(simulationTime));
     }
 
-    
-
-
-    // 8. MÔ PHỎNG KÊNH ĐIỀU KHIỂN UAV
-
-    // Cổng UDP 14550 dành cho dữ liệu điều khiển giả lập
-    // Chưa sử dụng giao thức MAVLink thực tế
+    // 8. GCS gửi gói điều khiển giả lập qua UDP/14550 đến UAV0
+    // Chưa tích hợp giao thức MAVLink thực tế hoặc Bridge.
     const uint16_t mavlinkPort = 14550;
-
-    // UAV0 nhận gói điều khiển từ GCS
     UdpServerHelper uavMavlinkServer(mavlinkPort);
-
-    ApplicationContainer uavMavlinkReceiver =
-        uavMavlinkServer.Install(uavs.Get(0));
-
+    ApplicationContainer uavMavlinkReceiver = uavMavlinkServer.Install(uavs.Get(0));
     uavMavlinkReceiver.Start(Seconds(0.5));
     uavMavlinkReceiver.Stop(Seconds(simulationTime));
 
-    // GCS gửi gói điều khiển đến UAV0
-    UdpClientHelper gcsControl(
-        interfaces.GetAddress(0),
-        mavlinkPort
-    );
-
-    gcsControl.SetAttribute(
-        "MaxPackets",
-        UintegerValue(30)
-    );
-
-    // Gửi một gói sau mỗi 500 ms
-    gcsControl.SetAttribute(
-        "Interval",
-        TimeValue(MilliSeconds(500))
-    );
-
-    gcsControl.SetAttribute(
-        "PacketSize",
-        UintegerValue(64)
-    );
-
-    ApplicationContainer gcsSender =
-        gcsControl.Install(gcs.Get(0));
-
+    UdpClientHelper gcsControl(interfaces.GetAddress(0), mavlinkPort);
+    gcsControl.SetAttribute("MaxPackets", UintegerValue(30));
+    gcsControl.SetAttribute("Interval", TimeValue(MilliSeconds(500)));
+    gcsControl.SetAttribute("PacketSize", UintegerValue(64));
+    ApplicationContainer gcsSender = gcsControl.Install(gcs.Get(0));
     gcsSender.Start(Seconds(2.0));
     gcsSender.Stop(Seconds(simulationTime));
 
-    
-
-
-
-    // 9. LƯU DỮ LIỆU GÓI TIN
-
-    // Tạo file PCAP để phân tích bằng Wireshark
+    // 9. Lưu PCAP để phân tích bằng Wireshark
     phy.EnablePcapAll("uav-network");
 
-    
-
-
-    // 10. CHẠY MÔ PHỎNG
-    
-
+    // 10. Chạy mô phỏng
     Simulator::Stop(Seconds(simulationTime));
     Simulator::Run();
 
-    
-    
-    // 11. THỐNG KÊ KẾT QUẢ
+    // 11. Thống kê kết quả
+    Ptr<UdpServer> control = DynamicCast<UdpServer>(uavMavlinkReceiver.Get(0));
+    uint64_t receivedTelemetry = g_stats.received;
+    uint64_t receivedControl = control->GetReceived();
+    uint64_t expectedTelemetry = static_cast<uint64_t>(numUavs) * 100;
+    double pdr = expectedTelemetry > 0
+                     ? 100.0 * receivedTelemetry / expectedTelemetry
+                     : 0.0;
 
-    // Lấy số gói telemetry mà GCS nhận được
-    Ptr<UdpServer> telemetry =
-        DynamicCast<UdpServer>(
-            telemetryReceiver.Get(0)
-        );
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "\n===== KET QUA MO PHONG =====\n";
+    std::cout << "Telemetry RX: " << receivedTelemetry << '\n';
+    std::cout << "Telemetry PDR: " << pdr << "%\n";
+    std::cout << "Control RX UAV0: " << receivedControl << '\n';
 
-    // Lấy số gói điều khiển mà UAV0 nhận được
-    Ptr<UdpServer> control =
-        DynamicCast<UdpServer>(
-            uavMavlinkReceiver.Get(0)
-        );
-
-    uint64_t receivedTelemetry =
-        telemetry->GetReceived();
-
-    uint64_t receivedControl =
-        control->GetReceived();
-
-    // Số gói dự kiến nếu mỗi UAV gửi đủ 100 gói
-    uint64_t expectedTelemetry =
-        static_cast<uint64_t>(numUavs) * 100;
-
-    // Tính tỷ lệ nhận gói thành công (PDR)
-    double pdr = 0.0;
-
-    if (expectedTelemetry > 0)
+    std::cout << "\n===== THONG KE DO TRE TELEMETRY =====\n";
+    if (receivedTelemetry > 0)
     {
-        pdr = 100.0 * receivedTelemetry
-              / expectedTelemetry;
+        std::cout << "Average Delay: " << g_stats.sumDelayMs / receivedTelemetry << " ms\n";
+        std::cout << "Min Delay: " << g_stats.minDelayMs << " ms\n";
+        std::cout << "Max Delay: " << g_stats.maxDelayMs << " ms\n";
+        if (g_stats.jitterSamples > 0)
+        {
+            std::cout << "Average Jitter: "
+                      << g_stats.sumJitterMs / g_stats.jitterSamples << " ms\n";
+        }
+        else
+        {
+            std::cout << "Average Jitter: N/A (khong du goi)\n";
+        }
+    }
+    else
+    {
+        std::cout << "Khong co goi Telemetry nao duoc nhan.\n";
     }
 
-    // Chỉ in các thông số quan trọng
-    std::cout << "\n===== KET QUA MO PHONG =====\n";
-
-    std::cout << "Telemetry RX: "
-              << receivedTelemetry << std::endl;
-
-    std::cout << "Telemetry PDR: "
-              << std::fixed << std::setprecision(2)
-              << pdr << "%\n";
-
-    std::cout << "Control RX UAV0: "
-              << receivedControl << std::endl;
-
-    // Giải phóng tài nguyên mô phỏng
     Simulator::Destroy();
-
     return 0;
 }
